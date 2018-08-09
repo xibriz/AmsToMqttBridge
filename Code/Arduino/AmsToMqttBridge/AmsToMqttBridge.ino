@@ -4,24 +4,24 @@
  Author:	roarf
 */
 
-
-#include <DallasTemperature.h>
-#include <OneWire.h>
-#include <ArduinoJson.h>
 #include <PubSubClient.h>
 #include <HanReader.h>
-#include <Kaifa.h>
 #include <Kamstrup.h>
 #include "configuration.h"
 #include "accesspoint.h"
 
 #define WIFI_CONNECTION_TIMEOUT 30000;
-#define TEMP_SENSOR_PIN 5 // Temperature sensor connected to GPIO5
 #define LED_PIN 2 // The blue on-board LED of the ESP
 
-OneWire oneWire(TEMP_SENSOR_PIN);
-DallasTemperature tempSensor(&oneWire);
-long lastTempDebug = 0;
+/**
+ * Firmware updater
+ */
+
+#include <ESP8266HTTPClient.h>
+#include <ESP8266httpUpdate.h>
+
+const int FW_VERSION = 1011;
+//const char* mqtt_topic_fw_info = "esp/test/info";
 
 // Object used to boot as Access Point
 accesspoint ap;
@@ -44,8 +44,9 @@ void setup()
 	
 	if (debugger) {
 		// Setup serial port for debugging
-		debugger->begin(2400, SERIAL_8E1);
+		debugger->begin(2400, SERIAL_8N1);
 		while (!&debugger);
+    debugger->setDebugOutput(true);
 		debugger->println("Started...");
 	}
 
@@ -66,10 +67,11 @@ void setup()
 	if (!ap.isActivated)
 	{
 		setupWiFi();
-		hanReader.setup(&Serial, 2400, SERIAL_8E1, debugger);
+		hanReader.setup(&Serial, 2400, SERIAL_8N1, debugger);
 		
 		// Compensate for the known Kaifa bug
-		hanReader.compensateFor09HeaderBug = (ap.config.meterType == 1);
+    //hanReader.compensateFor09HeaderBug = true;
+		//hanReader.compensateFor09HeaderBug = (ap.config.meterType == 1);
 	}
 }
 
@@ -110,14 +112,14 @@ void setupWiFi()
 {
 	// Turn off AP
 	WiFi.enableAP(false);
-	
+
 	// Connect to WiFi
 	WiFi.begin(ap.config.ssid, ap.config.ssidPassword);
-	
-	while (WiFi.status() != WL_CONNECTED) {
-		delay(500);
-	}
-	
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+  }
+  
 	// Initialize WiFi and MQTT clients
 	if (ap.config.isSecure())
 		client = new WiFiClientSecure();
@@ -134,7 +136,8 @@ void setupWiFi()
 	MQTT_connect();
 
 	// Notify everyone we're here!
-	sendMqttData("Connected!");
+	sendMqttData("Connected! MeterType:");
+  sendMqttData((String)ap.config.meterType);
 }
 
 void mqttMessageReceived(char* topic, unsigned char* payload, unsigned int length)
@@ -153,8 +156,7 @@ void mqttMessageReceived(char* topic, unsigned char* payload, unsigned int lengt
 		debugger->println(message);
 	}
 
-	// Do whatever needed here...
-	// Ideas could be to query for values or to initiate OTA firmware update
+  checkForUpdates(message);
 }
 
 void readHanPort()
@@ -166,18 +168,19 @@ void readHanPort()
 
 		// Get the list identifier
 		int listSize = hanReader.getListSize();
+    mqtt.publish((ap.config.mqttPublishTopic+((String)"/listSize")).c_str(), ((String)listSize).c_str());
 
 		switch (ap.config.meterType)
 		{
-		case 1: // Kaifa
+		/*case 1: // Kaifa
 			readHanPort_Kaifa(listSize);
-			break;
-		case 2: // Aidon
-			readHanPort_Aidon(listSize);
-			break;
+			break;*/
 		case 3: // Kamstrup
 			readHanPort_Kamstrup(listSize);
 			break;
+		/*case 3: // Aidon
+			readHanPort_Aidon(listSize);
+			break;*/
 		default:
 			debugger->print("Meter type ");
 			debugger->print(ap.config.meterType, HEX);
@@ -189,13 +192,6 @@ void readHanPort()
 		// Flash LED off
 		digitalWrite(LED_PIN, HIGH);
 	}
-}
-
-void readHanPort_Aidon(int listSize)
-{
-	if (debugger)
-		debugger->println("Meter type Aidon is not yet implemented");
-	delay(10000);
 }
 
 void readHanPort_Kamstrup(int listSize)
@@ -213,177 +209,90 @@ void readHanPort_Kamstrup(int listSize)
 			String id = hanReader.getString((int)Kamstrup_List2::ListVersionIdentifier);
 			if (debugger) debugger->println(id);
 		}
+   else if (listSize == (int)Kamstrup::List3)
+   {
+      String id = hanReader.getString((int)Kamstrup_List3::ListVersionIdentifier);
+      if (debugger) debugger->println(id);
+    }
+    else if (listSize == (int)Kamstrup::List4)
+    {
+      String id = hanReader.getString((int)Kamstrup_List4::ListVersionIdentifier);
+      if (debugger) debugger->println(id);
+    }
 
 		// Get the timestamp (as unix time) from the package
 		time_t time = hanReader.getPackageTime();
 		if (debugger) debugger->print("Time of the package is: ");
 		if (debugger) debugger->println(time);
 
-		// Define a json object to keep the data
-		StaticJsonBuffer<500> jsonBuffer;
-		JsonObject& root = jsonBuffer.createObject();
-
 		// Any generic useful info here
-		root["id"] = WiFi.macAddress();
-		root["up"] = millis();
-		root["t"] = time;
-
-		// Add a sub-structure to the json object, 
-		// to keep the data from the meter itself
-		JsonObject& data = root.createNestedObject("data");
-
-		// Get the temperature too
-		tempSensor.requestTemperatures();
-		float temperature = tempSensor.getTempCByIndex(0);
-		data["temp"] = temperature;
-
+		mqtt.publish((ap.config.mqttPublishTopic+((String)"/mac")).c_str(), ((String)WiFi.macAddress()).c_str());
+    mqtt.publish((ap.config.mqttPublishTopic+((String)"/uptime")).c_str(), ((String)millis()).c_str());
+    mqtt.publish((ap.config.mqttPublishTopic+((String)"/time")).c_str(), ((String)time).c_str());
+    
+    
 		// Based on the list number, get all details 
 		// according to OBIS specifications for the meter
 		if (listSize == (int)Kamstrup::List1)
 		{
-			data["lv"] = hanReader.getString((int)Kamstrup_List1::ListVersionIdentifier);
-			data["id"] = hanReader.getString((int)Kamstrup_List1::MeterID);
-			data["type"] = hanReader.getString((int)Kamstrup_List1::MeterType);
-			data["P"] = hanReader.getInt((int)Kamstrup_List1::ActiveImportPower);
-			data["Q"] = hanReader.getInt((int)Kamstrup_List1::ReactiveImportPower);
-			data["I1"] = hanReader.getInt((int)Kamstrup_List1::CurrentL1);
-			data["I2"] = hanReader.getInt((int)Kamstrup_List1::CurrentL2);
-			data["I3"] = hanReader.getInt((int)Kamstrup_List1::CurrentL3);
-			data["U1"] = hanReader.getInt((int)Kamstrup_List1::VoltageL1);
-			data["U2"] = hanReader.getInt((int)Kamstrup_List1::VoltageL2);
-			data["U3"] = hanReader.getInt((int)Kamstrup_List1::VoltageL3);
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/listversionidentifier")).c_str(), (hanReader.getString((int)Kamstrup_List1::ListVersionIdentifier)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/meterid")).c_str(), (hanReader.getString((int)Kamstrup_List1::MeterID)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/metertype")).c_str(), (hanReader.getString((int)Kamstrup_List1::MeterType)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/activeimportpower")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List1::ActiveImportPower)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/reactiveexportpower")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List1::ReactiveImportPower)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/currentl1")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List1::CurrentL1)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/currentl2")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List1::CurrentL2)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/currentl3")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List1::CurrentL3)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/voltagel1")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List1::VoltageL1)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/voltagel2")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List1::VoltageL2)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/voltagel3")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List1::VoltageL3)).c_str());
 		}
 		else if (listSize == (int)Kamstrup::List2)
 		{
-			data["lv"] = hanReader.getString((int)Kamstrup_List2::ListVersionIdentifier);;
-			data["id"] = hanReader.getString((int)Kamstrup_List2::MeterID);
-			data["type"] = hanReader.getString((int)Kamstrup_List2::MeterType);
-			data["P"] = hanReader.getInt((int)Kamstrup_List2::ActiveImportPower);
-			data["Q"] = hanReader.getInt((int)Kamstrup_List2::ReactiveImportPower);
-			data["I1"] = hanReader.getInt((int)Kamstrup_List2::CurrentL1);
-			data["I2"] = hanReader.getInt((int)Kamstrup_List2::CurrentL2);
-			data["I3"] = hanReader.getInt((int)Kamstrup_List2::CurrentL3);
-			data["U1"] = hanReader.getInt((int)Kamstrup_List2::VoltageL1);
-			data["U2"] = hanReader.getInt((int)Kamstrup_List2::VoltageL2);
-			data["U3"] = hanReader.getInt((int)Kamstrup_List2::VoltageL3);
-			data["tPI"] = hanReader.getInt((int)Kamstrup_List2::CumulativeActiveImportEnergy);
-			data["tPO"] = hanReader.getInt((int)Kamstrup_List2::CumulativeActiveExportEnergy);
-			data["tQI"] = hanReader.getInt((int)Kamstrup_List2::CumulativeReactiveImportEnergy);
-			data["tQO"] = hanReader.getInt((int)Kamstrup_List2::CumulativeReactiveExportEnergy);
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/listversionidentifier")).c_str(), (hanReader.getString((int)Kamstrup_List2::ListVersionIdentifier)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/meterid")).c_str(), (hanReader.getString((int)Kamstrup_List2::MeterID)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/metertype")).c_str(), (hanReader.getString((int)Kamstrup_List2::MeterType)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/activeimportpower")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List2::ActiveImportPower)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/reactiveimportpower")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List2::ReactiveImportPower)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/currentl1")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List2::CurrentL1)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/currentl2")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List2::CurrentL2)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/currentl3")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List2::CurrentL3)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/voltagel1")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List2::VoltageL1)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/voltagel2")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List2::VoltageL2)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/voltagel3")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List2::VoltageL3)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/cumulativeactiveimportenergy")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List2::CumulativeActiveImportEnergy)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/cumulativeactiveexportenergy")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List2::CumulativeActiveExportEnergy)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/cumulativereactiveimportenergy")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List2::CumulativeReactiveImportEnergy)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/cumulativereactiveexportenergy")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List2::CumulativeReactiveExportEnergy)).c_str());
 		}
-
-		// Write the json to the debug port
-		if (debugger) {
-			debugger->print("Sending data to MQTT: ");
-			root.printTo(*debugger);
-			debugger->println();
-		}
+    else if (listSize == (int)Kamstrup::List3)
+   {
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/listversionidentifier")).c_str(), (hanReader.getString((int)Kamstrup_List3::ListVersionIdentifier)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/meterid")).c_str(), (hanReader.getString((int)Kamstrup_List3::MeterID)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/metertype")).c_str(), (hanReader.getString((int)Kamstrup_List3::MeterType)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/activeimportpower")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List3::ActiveImportPower)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/reactiveexportpower")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List3::ReactiveImportPower)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/currentl1")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List3::CurrentL1)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/voltagel1")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List3::VoltageL1)).c_str());
+    }
+    else if (listSize == (int)Kamstrup::List4)
+    {
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/listversionidentifier")).c_str(), (hanReader.getString((int)Kamstrup_List4::ListVersionIdentifier)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/meterid")).c_str(), (hanReader.getString((int)Kamstrup_List4::MeterID)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/metertype")).c_str(), (hanReader.getString((int)Kamstrup_List4::MeterType)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/activeimportpower")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List4::ActiveImportPower)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/reactiveimportpower")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List4::ReactiveImportPower)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/currentl1")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List4::CurrentL1)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/voltagel1")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List4::VoltageL1)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/cumulativeactiveimportenergy")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List4::CumulativeActiveImportEnergy)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/cumulativeactiveexportenergy")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List4::CumulativeActiveExportEnergy)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/cumulativereactiveimportenergy")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List4::CumulativeReactiveImportEnergy)).c_str());
+      mqtt.publish((ap.config.mqttPublishTopic+((String)"/cumulativereactiveexportenergy")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List4::CumulativeReactiveExportEnergy)).c_str());
+    }
 
 		// Make sure we have configured a publish topic
-		if (ap.config.mqttPublishTopic == 0 || strlen(ap.config.mqttPublishTopic) == 0)
-			return;
-
-		// Publish the json to the MQTT server
-		char msg[1024];
-		root.printTo(msg, 1024);
-		mqtt.publish(ap.config.mqttPublishTopic, msg);
-	}
-}
-
-
-void readHanPort_Kaifa(int listSize) 
-{
-	// Only care for the ACtive Power Imported, which is found in the first list
-	if (listSize == (int)Kaifa::List1 || listSize == (int)Kaifa::List2 || listSize == (int)Kaifa::List3)
-	{
-		if (listSize == (int)Kaifa::List1)
-		{
-			if (debugger) debugger->println(" (list #1 has no ID)");
-		}
-		else
-		{
-			String id = hanReader.getString((int)Kaifa_List2::ListVersionIdentifier);
-			if (debugger) debugger->println(id);
-		}
-
-		// Get the timestamp (as unix time) from the package
-		time_t time = hanReader.getPackageTime();
-		if (debugger) debugger->print("Time of the package is: ");
-		if (debugger) debugger->println(time);
-
-		// Define a json object to keep the data
-		//StaticJsonBuffer<500> jsonBuffer;
-		DynamicJsonBuffer jsonBuffer;
-		JsonObject& root = jsonBuffer.createObject();
-
-		// Any generic useful info here
-		root["id"] = WiFi.macAddress();
-		root["up"] = millis();
-		root["t"] = time;
-
-		// Add a sub-structure to the json object, 
-		// to keep the data from the meter itself
-		JsonObject& data = root.createNestedObject("data");
-
-		// Get the temperature too
-		tempSensor.requestTemperatures();
-		float temperature = tempSensor.getTempCByIndex(0);
-		data["temp"] = String(temperature);
-
-		// Based on the list number, get all details 
-		// according to OBIS specifications for the meter
-		if (listSize == (int)Kaifa::List1)
-		{
-			data["P"] = hanReader.getInt((int)Kaifa_List1::ActivePowerImported);
-		}
-		else if (listSize == (int)Kaifa::List2)
-		{
-			data["lv"] = hanReader.getString((int)Kaifa_List2::ListVersionIdentifier);
-			data["id"] = hanReader.getString((int)Kaifa_List2::MeterID);
-			data["type"] = hanReader.getString((int)Kaifa_List2::MeterType);
-			data["P"] = hanReader.getInt((int)Kaifa_List2::ActiveImportPower);
-			data["Q"] = hanReader.getInt((int)Kaifa_List2::ReactiveImportPower);
-			data["I1"] = hanReader.getInt((int)Kaifa_List2::CurrentL1);
-			data["I2"] = hanReader.getInt((int)Kaifa_List2::CurrentL2);
-			data["I3"] = hanReader.getInt((int)Kaifa_List2::CurrentL3);
-			data["U1"] = hanReader.getInt((int)Kaifa_List2::VoltageL1);
-			data["U2"] = hanReader.getInt((int)Kaifa_List2::VoltageL2);
-			data["U3"] = hanReader.getInt((int)Kaifa_List2::VoltageL3);
-		}
-		else if (listSize == (int)Kaifa::List3)
-		{
-			data["lv"] = hanReader.getString((int)Kaifa_List3::ListVersionIdentifier);;
-			data["id"] = hanReader.getString((int)Kaifa_List3::MeterID);
-			data["type"] = hanReader.getString((int)Kaifa_List3::MeterType);
-			data["P"] = hanReader.getInt((int)Kaifa_List3::ActiveImportPower);
-			data["Q"] = hanReader.getInt((int)Kaifa_List3::ReactiveImportPower);
-			data["I1"] = hanReader.getInt((int)Kaifa_List3::CurrentL1);
-			data["I2"] = hanReader.getInt((int)Kaifa_List3::CurrentL2);
-			data["I3"] = hanReader.getInt((int)Kaifa_List3::CurrentL3);
-			data["U1"] = hanReader.getInt((int)Kaifa_List3::VoltageL1);
-			data["U2"] = hanReader.getInt((int)Kaifa_List3::VoltageL2);
-			data["U3"] = hanReader.getInt((int)Kaifa_List3::VoltageL3);
-			data["tPI"] = hanReader.getInt((int)Kaifa_List3::CumulativeActiveImportEnergy);
-			data["tPO"] = hanReader.getInt((int)Kaifa_List3::CumulativeActiveExportEnergy);
-			data["tQI"] = hanReader.getInt((int)Kaifa_List3::CumulativeReactiveImportEnergy);
-			data["tQO"] = hanReader.getInt((int)Kaifa_List3::CumulativeReactiveExportEnergy);
-		}
-
-		// Write the json to the debug port
-		if (debugger) {
-			debugger->print("Sending data to MQTT: ");
-			root.printTo(*debugger);
-			debugger->println();
-		}
-
-		// Make sure we have configured a publish topic
-		if (ap.config.mqttPublishTopic == 0 || strlen(ap.config.mqttPublishTopic) == 0)
-			return;
-
-		// Publish the json to the MQTT server
-		char msg[1024];
-		root.printTo(msg, 1024);
-		mqtt.publish(ap.config.mqttPublishTopic, msg);
+		//if (ap.config.mqttPublishTopic == 0 || strlen(ap.config.mqttPublishTopic) == 0)
+		//	return;
 	}
 }
 
@@ -398,6 +307,7 @@ void MQTT_connect()
 		debugger->println();
 		debugger->print("Connecting to WiFi network ");
 		debugger->println(ap.config.ssid);
+    debugger->println(ap.config.ssidPassword);
 	}
 
 	if (WiFi.status() != WL_CONNECTED)
@@ -489,17 +399,37 @@ void sendMqttData(String data)
 		MQTT_connect();
 	}
 
-	// Build a json with the message in a "data" attribute
-	DynamicJsonBuffer jsonBuffer;
-	JsonObject& json = jsonBuffer.createObject();
-	json["id"] = WiFi.macAddress();
-	json["up"] = millis();
-	json["data"] = data;
+  mqtt.publish(ap.config.mqttPublishTopic, ((String)WiFi.macAddress()).c_str());
+  mqtt.publish(ap.config.mqttPublishTopic, ((String)millis()).c_str());
+  mqtt.publish(ap.config.mqttPublishTopic, data.c_str());
+}
 
-	// Stringify the json
-	String msg;
-	json.printTo(msg);
 
-	// Send the json over MQTT
-	mqtt.publish(ap.config.mqttPublishTopic, msg.c_str());
+void checkForUpdates(String fwImageURL) {
+  HTTPClient httpClient;
+  
+  String newFWVersion = httpClient.getString();
+
+  mqtt.publish((ap.config.mqttPublishTopic+((String)"/info")).c_str(), ((String)"Current firmware version").c_str());
+  mqtt.publish((ap.config.mqttPublishTopic+((String)"/info")).c_str(), ((String)FW_VERSION).c_str());
+  
+  mqtt.publish((ap.config.mqttPublishTopic+((String)"/info")).c_str(), ((String)"Preparing to update").c_str());
+  
+  mqtt.publish((ap.config.mqttPublishTopic+((String)"/info")).c_str(), ((String)"Downloading new firmware.").c_str());
+  mqtt.publish((ap.config.mqttPublishTopic+((String)"/info")).c_str(), fwImageURL.c_str());
+      
+  t_httpUpdate_return ret = ESPhttpUpdate.update( fwImageURL );
+  
+  switch(ret) {
+     case HTTP_UPDATE_FAILED:
+       mqtt.publish((ap.config.mqttPublishTopic+((String)"/info")).c_str(), ((String)HTTP_UPDATE_FAILED).c_str());
+       mqtt.publish((ap.config.mqttPublishTopic+((String)"/info")).c_str(), ((String)ESPhttpUpdate.getLastError()).c_str());
+       mqtt.publish((ap.config.mqttPublishTopic+((String)"/info")).c_str(), ESPhttpUpdate.getLastErrorString().c_str());
+       break;
+    case HTTP_UPDATE_NO_UPDATES:
+       mqtt.publish((ap.config.mqttPublishTopic+((String)"/info")).c_str(), ((String)HTTP_UPDATE_NO_UPDATES).c_str());
+       break;
+  }
+    
+  httpClient.end();
 }
