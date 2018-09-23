@@ -46,7 +46,6 @@ private:
 
 	time_t toUnixTime(int year, int month, int day, int hour, int minute, int second);
 
-	void debugPrint(byte *buffer, int start, int length);
 };
 
 
