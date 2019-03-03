@@ -196,29 +196,33 @@ void readHanPort()
 
 void readHanPort_Kamstrup(int listSize)
 {
-	// Only care for the ACtive Power Imported, which is found in the first list
-	if (listSize == (int)Kamstrup::List1 || listSize == (int)Kamstrup::List2)
+  // Make sure we have configured a publish topic
+  if (ap.config.mqttPublishTopic == 0 || strlen(ap.config.mqttPublishTopic) == 0)
+  {
+    return;
+  }
+
+	// Check if valid kamstrup list
+	if (listSize == (int)Kamstrup::List1 || listSize == (int)Kamstrup::List2 || listSize == (int)Kamstrup::List3 || listSize == (int)Kamstrup::List4)
 	{
+    String id = "Unknown";
 		if (listSize == (int)Kamstrup::List1)
 		{
-			String id = hanReader.getString((int)Kamstrup_List1::ListVersionIdentifier);
-			if (debugger) debugger->println(id);
+			id = hanReader.getString((int)Kamstrup_List1::ListVersionIdentifier);
 		}
 		else if (listSize == (int)Kamstrup::List2)
 		{
-			String id = hanReader.getString((int)Kamstrup_List2::ListVersionIdentifier);
-			if (debugger) debugger->println(id);
+			id = hanReader.getString((int)Kamstrup_List2::ListVersionIdentifier);
 		}
-   else if (listSize == (int)Kamstrup::List3)
-   {
-      String id = hanReader.getString((int)Kamstrup_List3::ListVersionIdentifier);
-      if (debugger) debugger->println(id);
+    else if (listSize == (int)Kamstrup::List3)
+    {
+      id = hanReader.getString((int)Kamstrup_List3::ListVersionIdentifier);
     }
     else if (listSize == (int)Kamstrup::List4)
     {
-      String id = hanReader.getString((int)Kamstrup_List4::ListVersionIdentifier);
-      if (debugger) debugger->println(id);
+      id = hanReader.getString((int)Kamstrup_List4::ListVersionIdentifier);
     }
+    if (debugger) debugger->println(id);
 
 		// Get the timestamp (as unix time) from the package
 		time_t time = hanReader.getPackageTime();
@@ -266,7 +270,7 @@ void readHanPort_Kamstrup(int listSize)
       mqtt.publish((ap.config.mqttPublishTopic+((String)"/cumulativereactiveexportenergy")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List2::CumulativeReactiveExportEnergy)).c_str());
 		}
     else if (listSize == (int)Kamstrup::List3)
-   {
+    {
       mqtt.publish((ap.config.mqttPublishTopic+((String)"/listversionidentifier")).c_str(), (hanReader.getString((int)Kamstrup_List3::ListVersionIdentifier)).c_str());
       mqtt.publish((ap.config.mqttPublishTopic+((String)"/meterid")).c_str(), (hanReader.getString((int)Kamstrup_List3::MeterID)).c_str());
       mqtt.publish((ap.config.mqttPublishTopic+((String)"/metertype")).c_str(), (hanReader.getString((int)Kamstrup_List3::MeterType)).c_str());
@@ -289,10 +293,6 @@ void readHanPort_Kamstrup(int listSize)
       mqtt.publish((ap.config.mqttPublishTopic+((String)"/cumulativereactiveimportenergy")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List4::CumulativeReactiveImportEnergy)).c_str());
       mqtt.publish((ap.config.mqttPublishTopic+((String)"/cumulativereactiveexportenergy")).c_str(), ((String)hanReader.getInt((int)Kamstrup_List4::CumulativeReactiveExportEnergy)).c_str());
     }
-
-		// Make sure we have configured a publish topic
-		//if (ap.config.mqttPublishTopic == 0 || strlen(ap.config.mqttPublishTopic) == 0)
-		//	return;
 	}
 }
 
